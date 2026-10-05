@@ -1,17 +1,13 @@
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
-use hyper::{
-    header::{HeaderName, HeaderValue},
-    HeaderMap,
-};
-use once_cell::sync::Lazy;
-use opentelemetry::{global, trace::TraceError, trace::TracerProvider, KeyValue};
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{propagation::TraceContextPropagator, runtime, Resource};
+use anyhow::Result;
+use opentelemetry::{global, trace::TracerProvider, KeyValue};
+use opentelemetry_otlp::{WithExportConfig, WithTonicConfig};
+use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SdkTracerProvider, Resource};
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{metadata::MetadataMap, transport::Server as TonicServer, Response, Status};
 use tonic_tracing_opentelemetry::middleware::server;
-use tower::make::Shared;
 
 use news::news_service_server::NewsService;
 use news::news_service_server::NewsServiceServer;
@@ -20,14 +16,14 @@ use shuttle_runtime::Service;
 use tracing_subscriber::layer::SubscriberExt;
 
 pub mod news {
-    tonic::include_proto!("news"); // The package name specified in your .proto
+    tonic::include_proto!("news");
     pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
         tonic::include_file_descriptor_set!("news_descriptor");
 }
 
 #[derive(Debug, Default)]
 pub struct MyNewsService {
-    news: Arc<Mutex<Vec<News>>>, // Using a simple vector to store news items in memory
+    news: Arc<Mutex<Vec<News>>>,
 }
 
 impl MyNewsService {
@@ -72,6 +68,30 @@ impl MyNewsService {
         MyNewsService {
             news: Arc::new(Mutex::new(news)),
         }
+    }
+
+    async fn serve(
+        self,
+        listener: TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), tonic::transport::Error> {
+        // Keep the legacy reflection endpoint while also exposing stable v1.
+        let reflection = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(news::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .expect("Invalid news descriptor");
+        let reflection_alpha = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(news::FILE_DESCRIPTOR_SET)
+            .build_v1alpha()
+            .expect("Invalid news descriptor");
+
+        TonicServer::builder()
+            .layer(server::OtelGrpcLayer::default())
+            .add_service(NewsServiceServer::new(self))
+            .add_service(reflection)
+            .add_service(reflection_alpha)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+            .await
     }
 }
 
@@ -157,62 +177,42 @@ impl NewsService for MyNewsService {
     ) -> std::result::Result<Response<News>, Status> {
         let mut news = request.into_inner();
         let mut lock = self.news.lock().unwrap();
-        let new_id = lock.iter().map(|n| n.id).max().unwrap_or(0) + 1; // Simple ID generation
+        let new_id = lock.iter().map(|n| n.id).max().unwrap_or(0) + 1;
         news.id = new_id;
         lock.push(news.clone());
         Ok(Response::new(news))
     }
 }
 
-static RESOURCE: Lazy<Resource> = Lazy::new(|| {
-    Resource::default().merge(&Resource::new(vec![
-        KeyValue::new(
-            opentelemetry_semantic_conventions::resource::SERVICE_NAME,
-            "rust-grpc",
-        ),
-        KeyValue::new(
-            opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
-            "test",
-        ),
-    ]))
-});
-
 fn init_tracer() -> Result<()> {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
-    static TELEMETRY_URL: &str = "https://api.honeycomb.io:443";
-    let headers = HeaderMap::from_iter([(
-        HeaderName::from_static("x-honeycomb-team"),
-        HeaderValue::from_str(&std::env::var("HONEYCOMB_API_KEY")?)?,
-    )]);
-
-    let otlp_exporter = opentelemetry_otlp::new_exporter()
-        .tonic()
-        .with_endpoint(TELEMETRY_URL)
-        .with_metadata(MetadataMap::from_headers(headers));
-
-    let provider = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(otlp_exporter)
-        .with_trace_config(opentelemetry_sdk::trace::config().with_resource(RESOURCE.clone()))
-        .install_batch(runtime::Tokio)?
-        .provider()
-        .ok_or(TraceError::Other(
-            anyhow!("Failed to instantiate OTLP provider").into(),
-        ))?;
-
+    let mut metadata = MetadataMap::new();
+    metadata.insert("x-honeycomb-team", std::env::var("HONEYCOMB_API_KEY")?.parse()?);
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint("https://api.honeycomb.io:443")
+        .with_metadata(metadata)
+        .build()?;
+    let resource = Resource::builder()
+        .with_service_name("rust-grpc")
+        .with_attributes([KeyValue::new(
+            opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
+            "test",
+        )])
+        .build();
+    let provider = SdkTracerProvider::builder()
+        .with_resource(resource)
+        .with_batch_exporter(exporter)
+        .build();
     let tracer = provider.tracer("tracing");
     let trace_layer = tracing_opentelemetry::layer()
         .with_location(false)
         .with_threads(false)
         .with_tracer(tracer);
-
     let subscriber = tracing_subscriber::registry().with(trace_layer);
-
     tracing::subscriber::set_global_default(subscriber)?;
-
     global::set_tracer_provider(provider);
-
     Ok(())
 }
 
@@ -221,34 +221,90 @@ async fn shuttle_main() -> Result<impl Service, shuttle_runtime::Error> {
     if std::env::var("HONEYCOMB_API_KEY").is_ok() {
         init_tracer()?;
     }
-
-    let news_service = MyNewsService::new();
-
-    Ok(news_service)
+    Ok(MyNewsService::new())
 }
 
 #[async_trait::async_trait]
 impl Service for MyNewsService {
-    async fn bind(mut self, addr: std::net::SocketAddr) -> Result<(), shuttle_runtime::Error> {
-        let service = tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(news::FILE_DESCRIPTOR_SET)
-            .build()
-            .unwrap();
+    async fn bind(self, addr: std::net::SocketAddr) -> Result<(), shuttle_runtime::Error> {
+        let listener = TcpListener::bind(addr).await?;
+        println!("NewsService server listening on {}", listener.local_addr()?);
+        self.serve(listener, std::future::pending()).await?;
+        Ok(())
+    }
+}
 
-        println!("NewsService server listening on {}", addr);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use news::news_service_client::NewsServiceClient;
+    use std::time::Duration;
+    use tonic_reflection::pb::{v1, v1alpha};
 
-        let tonic_service = TonicServer::builder()
-            .layer(server::OtelGrpcLayer::default())
-            .add_service(NewsServiceServer::new(self))
-            .add_service(service)
-            .into_service();
-        let make_svc = Shared::new(tonic_service);
+    #[tokio::test]
+    async fn grpc_crud_and_reflection_round_trip() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(MyNewsService::new().serve(listener, async {
+                let _ = stopped.await;
+            }));
+            let mut client = NewsServiceClient::connect(endpoint.clone()).await?;
+            assert_eq!(client.get_all_news(()).await?.into_inner().news.len(), 5);
+            assert_eq!(client.get_news(NewsId { id: 1 }).await?.into_inner().title, "Note 1");
+            let mut added = client.add_news(News {
+                id: 0,
+                title: "New".into(),
+                body: "Body".into(),
+                post_image: "Image".into(),
+                status: 0,
+            }).await?.into_inner();
+            assert_eq!(added.id, 6);
+            added.title = "Edited".into();
+            client.edit_news(added.clone()).await?;
+            let selected = client.get_multiple_news(MultipleNewsId {
+                ids: vec![NewsId { id: added.id }],
+            }).await?.into_inner();
+            assert_eq!(selected.news, vec![added.clone()]);
+            client.delete_news(NewsId { id: added.id }).await?;
+            assert_eq!(client.get_news(NewsId { id: added.id }).await.unwrap_err().code(), tonic::Code::NotFound);
 
-        let server = hyper::Server::bind(&addr).serve(make_svc);
-        server
-            .await
-            .map_err(|e| shuttle_runtime::Error::Custom(anyhow::anyhow!(e)))?;
+            let mut reflection = v1::server_reflection_client::ServerReflectionClient::connect(endpoint.clone()).await?;
+            let mut stream = reflection.server_reflection_info(tokio_stream::iter([
+                v1::ServerReflectionRequest {
+                    host: String::new(),
+                    message_request: Some(v1::server_reflection_request::MessageRequest::ListServices(String::new())),
+                },
+            ])).await?.into_inner();
+            let response = stream.message().await?.expect("reflection response");
+            let Some(v1::server_reflection_response::MessageResponse::ListServicesResponse(services)) = response.message_response else {
+                anyhow::bail!("expected v1 service list");
+            };
+            assert!(services.service.iter().any(|service| service.name == "news.NewsService"));
+            drop(stream);
+            drop(reflection);
 
+            let mut reflection = v1alpha::server_reflection_client::ServerReflectionClient::connect(endpoint).await?;
+            let mut stream = reflection.server_reflection_info(tokio_stream::iter([
+                v1alpha::ServerReflectionRequest {
+                    host: String::new(),
+                    message_request: Some(v1alpha::server_reflection_request::MessageRequest::ListServices(String::new())),
+                },
+            ])).await?.into_inner();
+            let response = stream.message().await?.expect("legacy reflection response");
+            let Some(v1alpha::server_reflection_response::MessageResponse::ListServicesResponse(services)) = response.message_response else {
+                anyhow::bail!("expected v1alpha service list");
+            };
+            assert!(services.service.iter().any(|service| service.name == "news.NewsService"));
+            drop(stream);
+            drop(reflection);
+            drop(client);
+            let _ = stop.send(());
+            task.await??;
+            println!("PASS: six News RPCs, NotFound status, v1 and v1alpha reflection over HTTP/2");
+            Ok::<(), anyhow::Error>(())
+        }).await??;
         Ok(())
     }
 }
